@@ -75,8 +75,8 @@ impl WgUpstream {
         if crate::util::restore_existing_interface(&self.interface).await? {
             return Ok(());
         }
-        run_wg_quick(self.quick_binary, "up", path).await?;
         self.started.store(true, Ordering::Relaxed);
+        run_wg_quick(self.quick_binary, "up", path).await?;
         interface_is_up(&self.interface).await?;
         info!(upstream = %self.name, interface = %self.interface, "upstream поднят");
         Ok(())
@@ -89,7 +89,14 @@ impl WgUpstream {
         let Some(path) = &self.config_path else {
             return Ok(());
         };
-        run_wg_quick(self.quick_binary, "down", path).await?;
+        let exists = crate::util::command_output(
+            Command::new("ip").args(["link", "show", &self.interface]),
+            None,
+        )
+        .await?;
+        if exists.status.success() {
+            run_wg_quick(self.quick_binary, "down", path).await?;
+        }
         self.started.store(false, Ordering::Relaxed);
         Ok(())
     }
@@ -102,12 +109,10 @@ impl WgUpstream {
 }
 
 async fn run_wg_quick(binary: &str, action: &str, config_path: &Path) -> Result<()> {
-    let output = Command::new(binary)
-        .arg(action)
-        .arg(config_path)
-        .output()
-        .await
-        .with_context(|| format!("{binary} {action} {}", config_path.display()))?;
+    let output =
+        crate::util::command_output(Command::new(binary).arg(action).arg(config_path), None)
+            .await
+            .with_context(|| format!("{binary} {action} {}", config_path.display()))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

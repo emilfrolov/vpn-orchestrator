@@ -10,9 +10,10 @@
 //! 3. Добавить match-ветки в методы `UpstreamKind`
 //! 4. Добавить тип в [`UpstreamType`] и в [`create_upstream`]
 
+use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use tokio::task::JoinHandle;
 use tokio::time;
@@ -88,10 +89,12 @@ fn create_upstream(config: &UpstreamConfig) -> Result<UpstreamKind> {
 }
 
 pub struct UpstreamManager {
-    upstreams: Vec<UpstreamKind>,
+    upstreams: Vec<Arc<UpstreamKind>>,
+    recovery_tasks: Vec<Option<JoinHandle<Result<()>>>>,
+    ready: Vec<bool>,
     active_index: Option<usize>,
     failure_count: u32,
-    routing: Option<RoutingSetup>,
+    routing: Option<Arc<RoutingSetup>>,
     nat: Option<NatSetup>,
     server_interface: String,
     server_subnet: String,
@@ -117,11 +120,11 @@ struct SpeedMeasurement {
 
 impl UpstreamManager {
     pub async fn start(config: &Config) -> Result<Self> {
-        let upstreams: Vec<UpstreamKind> = config
+        let upstreams: Vec<Arc<UpstreamKind>> = config
             .upstream
             .iter()
             .filter(|u| u.enabled)
-            .map(create_upstream)
+            .map(|c| create_upstream(c).map(Arc::new))
             .collect::<Result<Vec<_>>>()?;
 
         let routing = RoutingSetup::apply(config).await?;
@@ -134,10 +137,12 @@ impl UpstreamManager {
         };
 
         let mut manager = Self {
+            ready: vec![false; upstreams.len()],
+            recovery_tasks: (0..upstreams.len()).map(|_| None).collect(),
             upstreams,
             active_index: None,
             failure_count: 0,
-            routing: Some(routing),
+            routing: Some(Arc::new(routing)),
             nat: None,
             server_interface: config.server.interface.clone(),
             server_subnet: config.server.subnet.to_string(),
@@ -172,13 +177,43 @@ impl UpstreamManager {
             https_task: None,
         };
 
+        info!(event = "selection_config", monitoring_enabled = config.monitoring.enabled,
+              selector = ?config.monitoring.selector,
+              speed_test_enabled = manager.speed_test.enabled,
+              speed_interval_secs = manager.speed_test.interval,
+              speed_timeout_secs = manager.speed_test.timeout,
+              min_mbps = manager.speed_test.min_mbps, download_used_in_score = false,
+              "настройки выбора upstream");
+        if config.monitoring.enabled {
+            info!(event = "monitoring_config", health_targets = ?config.monitoring.health_targets,
+                  health_interval_secs = config.monitoring.health_interval,
+                  health_timeout_secs = config.monitoring.health_timeout,
+                  health_probe_count = config.monitoring.health_probe_count,
+                  https_enabled = config.monitoring.https_enabled,
+                  https_target_count = config.monitoring.https_targets.len(),
+                  https_interval_secs = config.monitoring.https_interval,
+                  https_timeout_secs = config.monitoring.https_timeout,
+                  ewma_alpha = config.monitoring.ewma_alpha, scoring = ?config.monitoring.scoring,
+                  "настройки проб и scoring");
+        }
+        for upstream in config.upstream.iter().filter(|u| u.enabled) {
+            info!(event = "upstream_health_config", upstream = %upstream.name,
+                  interface = %upstream.interface, target = %upstream.health_check_target,
+                  interval_secs = upstream.health_check_interval,
+                  timeout_secs = upstream.health_check_timeout, threshold = upstream.failover_threshold,
+                  "настройки обычного health-check");
+        }
+
         for i in 0..manager.upstreams.len() {
-            if let Err(e) = manager.start_upstream(i).await {
-                warn!(upstream = manager.upstreams[i].name(), error = %e, "не удалось запустить upstream");
-            }
+            manager.request_recovery(i);
+        }
+        for i in 0..manager.upstreams.len() {
+            manager.finish_recovery(i).await;
         }
         if let Err(error) = manager.select_initial().await {
-            manager.shutdown().await;
+            if let Err(cleanup) = manager.shutdown().await {
+                return Err(error.context(format!("ошибка очистки: {cleanup:#}")));
+            }
             return Err(error);
         }
 
@@ -221,6 +256,9 @@ impl UpstreamManager {
 
     async fn select_initial(&mut self) -> Result<()> {
         for i in 0..self.upstreams.len() {
+            if !self.ready[i] {
+                continue;
+            }
             let upstream = &self.upstreams[i];
             match upstream.health_check().await {
                 Ok(()) => match self.activate(i).await {
@@ -364,11 +402,38 @@ impl UpstreamManager {
         }
     }
 
-    async fn start_upstream(&self, index: usize) -> Result<()> {
-        let upstream = &self.upstreams[index];
-        upstream.start().await?;
-        if let Some(routing) = &self.routing {
-            routing.prepare_probe_route(upstream.interface()).await?;
+    fn request_recovery(&mut self, index: usize) {
+        if self.recovery_tasks[index].is_none() {
+            let upstream = self.upstreams[index].clone();
+            let routing = self.routing.clone();
+            self.recovery_tasks[index] = Some(tokio::spawn(async move {
+                upstream.start().await?;
+                if let Some(routing) = routing {
+                    routing.prepare_probe_route(upstream.interface()).await?;
+                }
+                Ok(())
+            }));
+        }
+    }
+
+    async fn finish_recovery(&mut self, index: usize) {
+        let Some(task) = self.recovery_tasks[index].take() else {
+            return;
+        };
+        let result = task
+            .await
+            .context("recovery task")
+            .and_then(|result| result);
+        self.ready[index] = result.is_ok();
+        if let Err(error) = result {
+            warn!(upstream = self.upstreams[index].name(), error = %error, "восстановление upstream не удалось");
+        }
+    }
+
+    fn ensure_upstream_ready(&mut self, index: usize) -> Result<()> {
+        if !self.ready[index] {
+            self.request_recovery(index);
+            anyhow::bail!("восстановление upstream выполняется в фоне");
         }
         Ok(())
     }
@@ -378,7 +443,22 @@ impl UpstreamManager {
         let mut last_monitor: Option<std::time::Instant> = None;
         let mut last_https: Option<std::time::Instant> = None;
         let mut last_speed: Option<std::time::Instant> = None;
+        let mut last_recovery: Option<std::time::Instant> = None;
         loop {
+            for i in 0..self.upstreams.len() {
+                if self.recovery_tasks[i]
+                    .as_ref()
+                    .is_some_and(JoinHandle::is_finished)
+                {
+                    self.finish_recovery(i).await;
+                }
+            }
+            if last_recovery.is_none_or(|t| t.elapsed() >= Duration::from_secs(10)) {
+                for i in 0..self.upstreams.len() {
+                    self.request_recovery(i);
+                }
+                last_recovery = Some(std::time::Instant::now());
+            }
             if self
                 .speed_task
                 .as_ref()
@@ -422,10 +502,13 @@ impl UpstreamManager {
             {
                 match self.health_task.take().unwrap().await {
                     Ok(outcomes) => {
-                        if let Some(decision) =
-                            self.monitor.as_mut().unwrap().apply_health_probes(outcomes)
+                        if let Some(decision) = self
+                            .monitor
+                            .as_mut()
+                            .unwrap()
+                            .apply_health_probes(outcomes, self.active_index)
                         {
-                            self.handle_switch_decision(decision).await;
+                            self.handle_switch_decision(decision, "health_score").await;
                         }
                     }
                     Err(error) => error!(error = %error, "ICMP task завершилась"),
@@ -433,9 +516,7 @@ impl UpstreamManager {
             }
             if monitor_due && self.health_task.is_none() {
                 for i in 0..self.upstreams.len() {
-                    if let Err(e) = self.start_upstream(i).await {
-                        warn!(upstream = self.upstreams[i].name(), error = %e, "восстановление upstream не удалось");
-                    }
+                    self.request_recovery(i);
                 }
                 self.health_task = Some(self.monitor.as_ref().unwrap().start_health_probes());
                 last_monitor = Some(std::time::Instant::now());
@@ -460,7 +541,7 @@ impl UpstreamManager {
                 && last_speed
                     .is_none_or(|t| t.elapsed() >= Duration::from_secs(self.speed_test.interval))
             {
-                self.start_speed_tests().await;
+                self.start_speed_tests();
                 last_speed = Some(std::time::Instant::now());
             }
             self.publish_metrics();
@@ -468,7 +549,7 @@ impl UpstreamManager {
         }
     }
 
-    async fn start_speed_tests(&mut self) {
+    fn start_speed_tests(&mut self) {
         let mut interfaces = Vec::new();
         for i in 0..self.upstreams.len() {
             if self
@@ -482,7 +563,7 @@ impl UpstreamManager {
                 );
                 continue;
             }
-            if let Err(e) = self.start_upstream(i).await {
+            if let Err(e) = self.ensure_upstream_ready(i) {
                 warn!(upstream = self.upstreams[i].name(), error = %e, "speed test: upstream недоступен");
                 continue;
             }
@@ -541,15 +622,32 @@ impl UpstreamManager {
                 })
                 .collect();
             if eligible.is_none() {
+                let current = speeds[active];
+                let reason = if self.speed_test.min_mbps <= 0.0 {
+                    "diagnostic_only"
+                } else if current.is_none() {
+                    "active_measurement_missing"
+                } else if current.is_some_and(|speed| speed >= self.speed_test.min_mbps) {
+                    "active_speed_sufficient"
+                } else {
+                    "no_faster_candidate"
+                };
+                debug!(event = "speed_switch_skipped", reason, active = self.upstreams[active].name(),
+                       active_mbps = ?current, min_mbps = self.speed_test.min_mbps,
+                       "speed test: переключение пропущено");
                 self.speed_selector.set_active(active); // reset consecutive speed wins
-            } else if let Some(decision) = self.speed_selector.evaluate(&scores) {
+            } else if let Some(decision) =
+                tracing::info_span!("selector", source = "download_speed")
+                    .in_scope(|| self.speed_selector.evaluate(&scores))
+            {
                 info!(from = %decision.from_name, to = %decision.to_name, "speed test: подтверждён кандидат на переключение");
-                self.handle_switch_decision(decision).await;
+                self.handle_switch_decision(decision, "download_speed")
+                    .await;
             }
         }
     }
 
-    async fn handle_switch_decision(&mut self, d: SwitchDecision) {
+    async fn handle_switch_decision(&mut self, d: SwitchDecision, source: &str) {
         let to_idx = d.to;
         let from_idx = d.from;
 
@@ -558,17 +656,17 @@ impl UpstreamManager {
                 consecutive_wins,
                 advantage_pct,
             } => {
-                info!(from = %d.from_name, to = %d.to_name, from_score = format!("{:.1}", d.from_score),
+                info!(source, from = %d.from_name, to = %d.to_name, from_score = format!("{:.1}", d.from_score),
                       to_score = format!("{:.1}", d.to_score), advantage_pct = format!("{:.1}%", advantage_pct),
                       consecutive_wins, reason = "quality_advantage", "vpn_switch_requested");
             }
             SwitchReason::EmergencyFailover => {
-                warn!(from = %d.from_name, to = %d.to_name, from_score = format!("{:.1}", d.from_score),
+                warn!(source, from = %d.from_name, to = %d.to_name, from_score = format!("{:.1}", d.from_score),
                       to_score = format!("{:.1}", d.to_score), reason = "emergency_failover", "vpn_switch_requested");
             }
         }
 
-        if let Err(e) = self.start_upstream(to_idx).await {
+        if let Err(e) = self.ensure_upstream_ready(to_idx) {
             warn!(candidate = %d.to_name, error = %e, "preflight start failed");
             if let Some(ref mut m) = self.monitor {
                 m.set_selector_active(from_idx);
@@ -596,7 +694,9 @@ impl UpstreamManager {
         let active_interface = self.upstreams[to_idx].interface().to_string();
         match self.upstreams[to_idx].health_check().await {
             Ok(_) => {
-                info!(to = %d.to_name, interface = %active_interface, "verify passed — переключение подтверждено");
+                info!(event = "vpn_switch_verified", source, to = %d.to_name,
+                      interface = %active_interface, verification = "post_activation_ping",
+                      "verify passed — переключение подтверждено");
             }
             Err(e) => {
                 error!(to = %d.to_name, interface = %active_interface, error = %e, "verify failed — rollback");
@@ -643,20 +743,34 @@ impl UpstreamManager {
     }
 
     async fn failover(&mut self) {
+        let previous = self
+            .active_index
+            .map(|i| self.upstreams[i].name().to_string());
+        warn!(event = "vpn_failover_started", from = ?previous, failures = self.failure_count,
+              "аварийный поиск доступного upstream");
         if let Err(e) = self.try_recover().await {
-            debug!(error = %e, "VPN failover не удался");
+            warn!(event = "vpn_failover_failed", from = ?previous, error = %e,
+                  "VPN failover не удался");
             self.enter_outage().await;
+        } else {
+            info!(event = "vpn_failover_completed", from = ?previous,
+                  to = self.active_index.map(|i| self.upstreams[i].name()),
+                  verification = "pre_activation_ping_only",
+                  "аварийная активация upstream завершена");
         }
     }
 
     async fn try_recover(&mut self) -> Result<()> {
         for i in 0..self.upstreams.len() {
-            let upstream = &self.upstreams[i];
-            if let Err(e) = self.start_upstream(i).await {
+            let upstream = self.upstreams[i].clone();
+            if let Err(e) = self.ensure_upstream_ready(i) {
                 debug!(upstream = upstream.name(), error = %e, "не удалось запустить");
                 continue;
             }
-            if upstream.health_check().await.is_ok() {
+            if let Err(error) = upstream.health_check().await {
+                debug!(event = "recovery_candidate_rejected", upstream = upstream.name(),
+                       error = %error, "health-check кандидата не прошёл");
+            } else {
                 match self.activate(i).await {
                     Ok(()) => return Ok(()),
                     Err(e) => {
@@ -668,7 +782,16 @@ impl UpstreamManager {
         anyhow::bail!("нет здоровых upstream")
     }
 
-    pub async fn shutdown(&mut self) {
+    pub async fn shutdown(&mut self) -> Result<()> {
+        for task in self.recovery_tasks.iter().flatten() {
+            task.abort();
+        }
+        for task in &mut self.recovery_tasks {
+            if let Some(task) = task.take() {
+                let _ = task.await;
+            }
+        }
+        let mut results = Vec::new();
         if let Some(task) = self.health_task.take() {
             task.abort();
         }
@@ -679,20 +802,25 @@ impl UpstreamManager {
             task.abort();
         }
         if let Some(nat) = self.nat.take() {
-            if let Err(e) = nat.cleanup().await {
-                error!(error = %e, "ошибка очистки NAT");
-            }
+            results.push(nat.cleanup().await.context("ошибка очистки NAT"));
         }
         if let Some(routing) = self.routing.take() {
-            if let Err(e) = routing.cleanup().await {
-                error!(error = %e, "ошибка очистки маршрутизации");
-            }
+            results.push(
+                routing
+                    .cleanup()
+                    .await
+                    .context("ошибка очистки маршрутизации"),
+            );
         }
         for upstream in &self.upstreams {
-            if let Err(e) = upstream.stop().await {
-                warn!(upstream = upstream.name(), error = %e, "ошибка остановки");
-            }
+            results.push(
+                upstream
+                    .stop()
+                    .await
+                    .with_context(|| format!("ошибка остановки {}", upstream.name())),
+            );
         }
+        crate::util::cleanup_result(results)
     }
 }
 

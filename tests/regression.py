@@ -152,8 +152,14 @@ class LifecycleTests(unittest.TestCase):
         self.wait_for(lambda: self.selected("wg1"))
         (self.root / "wg1-down").touch()
         self.wait_for(lambda: self.selected("wg2"))
+        self.wait_for(lambda: "vpn_failover_completed" in (self.root / "output").read_text())
         self.process.send_signal(signal.SIGTERM)
         self.assertEqual(self.process.wait(timeout=5), 0)
+        output = (self.root / "output").read_text()
+        self.assertIn('event="selection_config"', output)
+        self.assertIn('event="vpn_failover_started"', output)
+        self.assertIn('verification="pre_activation_ping_only"', output)
+        self.assertIn('status=exit status: 1', output)
         self.assertFalse(any(c[0] in ("nft", "iptables") for c in self.commands()))
         self.assertIn(["ip", "rule", "add", "priority", "98", "oif", "wg2", "table", "102"], self.commands())
         self.assertFalse(any(c[0].endswith("quick") for c in self.commands()))
@@ -169,14 +175,38 @@ class LifecycleTests(unittest.TestCase):
         self.wait_for(lambda: self.selected("wg2"))
 
     def test_monitoring_without_selector_preserves_failover(self):
-        self.start(extra='[monitoring]\nenabled=true\nhealth_interval=1\nhealth_probe_count=1\nhttps_enabled=false')
+        self.start(extra='[monitoring]\nenabled=true\nhealth_interval=1\nhealth_probe_count=1\nhttps_enabled=false\n[logging]\nlevel="debug"')
         self.wait_for(lambda: self.selected("wg1"))
+        self.wait_for(lambda: 'reason="disabled"' in (self.root / "output").read_text())
+        output = (self.root / "output").read_text()
+        self.assertIn('event="upstream_score"', output)
+        for field in ('raw_score=', 'ewma_score=', 'final_score=', 'ewma_loss_pct=', 'health_probe_age_secs='):
+            self.assertIn(field, output)
+        self.assertIn('source="health_score"', output)
+        self.assertIn('interface=wg1 selected=true', output)
+        self.assertIn('interface=wg2 selected=false', output)
         (self.root / "wg1-down").touch()
         self.wait_for(lambda: self.selected("wg2"))
+
+    def test_monitoring_reports_no_selected_vpn_when_routes_fail(self):
+        (self.root / "fail-command").write_text("ip route replace default dev wg")
+        self.start(extra='[monitoring]\nenabled=true\nhealth_interval=1\nhealth_probe_count=1\nhttps_enabled=false\n[monitoring.selector]\nenabled=true\n[logging]\nlevel="debug"')
+        self.wait_for(lambda: (self.root / "output").read_text().count('event="upstream_score" vpn=backup') >= 2)
+        output = (self.root / "output").read_text()
+        self.assertIn('event="direct_fallback_enabled"', output)
+        self.assertNotIn('event="vpn_activated"', output)
+        for line in output.splitlines():
+            if 'event="upstream_score"' in line:
+                self.assertIn('state=HEALTHY', line)
+                self.assertIn('selected=false', line)
 
     def test_speed_test_switches_to_faster_upstream(self):
         self.start(extra='[speed_test]\nenabled=true\ninterval=1\ntimeout=1\nmin_mbps=5.0\n[monitoring.selector]\nminimum_hold_secs=0\ncooldown_secs=0\nconsecutive_wins=1')
         self.wait_for(lambda: self.selected("wg2"))
+        self.wait_for(lambda: 'event="vpn_switch_verified"' in (self.root / "output").read_text())
+        output = (self.root / "output").read_text()
+        self.assertIn('source="download_speed"', output)
+        self.assertIn('verification="post_activation_ping"', output)
         curl = next(c for c in self.commands() if c[0] == "curl")
         self.assertIn("--noproxy", curl)
         self.assertIn("--fail", curl)
@@ -214,9 +244,10 @@ class LifecycleTests(unittest.TestCase):
 
     def test_speed_test_logs_curl_error(self):
         (self.root / "curl-fail").touch()
-        self.start(extra='[speed_test]\nenabled=true\ninterval=1\ntimeout=1')
-        self.wait_for(lambda: "speed test failed" in (self.root / "output").read_text())
+        self.start(extra='[speed_test]\nenabled=true\ninterval=1\ntimeout=1\nmin_mbps=5.0\n[logging]\nlevel="debug"')
+        self.wait_for(lambda: 'reason="active_measurement_missing"' in (self.root / "output").read_text())
         self.assertIn("curl завершился с", (self.root / "output").read_text())
+        self.assertFalse(self.selected("wg2"))
 
     def test_route_error_tries_backup_and_cleans_managed_server(self):
         (self.root / "server-down").touch()
@@ -313,8 +344,9 @@ class LifecycleTests(unittest.TestCase):
         self.wait_for(lambda: self.selected("wg2"), timeout=3)
 
     def test_speed_respects_hold(self):
-        self.start(extra='[monitoring.selector]\nminimum_hold_secs=3600\ncooldown_secs=3600\n[speed_test]\nenabled=true\ninterval=1\ntimeout=1\nmin_mbps=5.0')
+        self.start(extra='[monitoring.selector]\nminimum_hold_secs=3600\ncooldown_secs=3600\n[speed_test]\nenabled=true\ninterval=1\ntimeout=1\nmin_mbps=5.0\n[logging]\nlevel="debug"')
         self.wait_for(lambda: (self.root / "output").read_text().count('speed test upstream="backup"') >= 3)
+        self.assertIn('reason="minimum_hold"', (self.root / "output").read_text())
         self.assertFalse(self.selected("wg2"))
 
     def test_redirect_does_not_trigger_speed_switch(self):
@@ -341,6 +373,97 @@ class LifecycleTests(unittest.TestCase):
             self.assertFalse(any(c[0].endswith("quick") for c in self.commands()))
         finally:
             globals()["CONFIG"] = original
+
+    def start_slow_recovery(self):
+        extra_fake = r'''
+if name == "ip" and args[:3] == ["link", "show", "wg2"] and (root / "backup-missing").exists():
+    sys.exit(1)
+if name == "wg-quick" and args[0] == "up":
+    import subprocess
+    (root / "backup-missing").unlink(missing_ok=True)
+    (root / "up-started").touch()
+    subprocess.Popen([sys.executable, "-c", "import time,pathlib; time.sleep(4); pathlib.Path(" + repr(str(root / "descendant-completed")) + ").touch()"])
+    time.sleep(4)
+    (root / "up-completed").touch()
+if name == "wg-quick" and args[0] == "down":
+    (root / "down-completed").touch()
+'''
+        fake = FAKE.replace('if name == "ip":', extra_fake + '\nif name == "ip":', 1)
+        for tool in ("ip", "wg-quick"):
+            (self.root / tool).write_text("#!" + sys.executable + "\n" + fake)
+        original = globals()["CONFIG"]
+        globals()["CONFIG"] = CONFIG.replace('interface = "wg2"', f'interface = "wg2"\nconfig_path = "{self.root}/wg2.conf"')
+        try:
+            self.start(extra='[monitoring]\nenabled=true\nhealth_interval=1\nhealth_probe_count=1\nhttps_enabled=false', disabled='[[upstream]]\nname="third"\ntype="wireguard"\ninterface="wg3"\nhealth_check_interval=1\nfailover_threshold=1')
+        finally:
+            globals()["CONFIG"] = original
+        self.wait_for(lambda: self.selected("wg1"))
+        (self.root / "wg2-down").touch()
+        (self.root / "backup-missing").touch()
+        self.wait_for(lambda: (self.root / "up-started").exists())
+
+    def test_shutdown_cancels_recovery_and_cleans_partial_interface(self):
+        self.start_slow_recovery()
+        self.process.terminate()
+        self.assertEqual(self.process.wait(timeout=3), 0)
+        self.assertTrue((self.root / "down-completed").exists())
+        time.sleep(4.2)
+        self.assertFalse((self.root / "up-completed").exists())
+        self.assertFalse((self.root / "descendant-completed").exists())
+
+    def test_slow_recovery_does_not_block_failover_to_ready_backup(self):
+        self.start_slow_recovery()
+        (self.root / "wg1-down").touch()
+        self.wait_for(lambda: self.selected("wg3"), timeout=3)
+        self.assertFalse((self.root / "up-completed").exists())
+
+    def test_cleanup_reports_errors_and_continues(self):
+        self.start()
+        self.wait_for(lambda: self.selected("wg1"))
+        (self.root / "fail-command").write_text("ip rule del priority 100")
+        self.process.terminate()
+        self.assertNotEqual(self.process.wait(timeout=5), 0)
+        self.assertIn("injected command failure", (self.root / "output").read_text())
+        self.assertIn(["ip", "route", "flush", "table", "100"], self.commands())
+
+    def test_nat_cleanup_reports_error_and_continues_routes(self):
+        self.start(nat=True)
+        self.wait_for(lambda: "NAT и FORWARD" in (self.root / "output").read_text())
+        (self.root / "fail-command").write_text("iptables -D")
+        self.process.terminate()
+        self.assertNotEqual(self.process.wait(timeout=5), 0)
+        self.assertIn("ошибка очистки NAT", (self.root / "output").read_text())
+        self.assertIn(["ip", "route", "flush", "table", "100"], self.commands())
+
+    def test_nft_cleanup_error_is_reported(self):
+        original = globals()["CONFIG"]
+        globals()["CONFIG"] = CONFIG.replace("use_nftables = false", "use_nftables = true")
+        try:
+            self.start(nat=True)
+        finally:
+            globals()["CONFIG"] = original
+        self.wait_for(lambda: "NAT и FORWARD" in (self.root / "output").read_text())
+        (self.root / "fail-command").write_text("nft delete")
+        self.process.terminate()
+        self.assertNotEqual(self.process.wait(timeout=5), 0)
+        self.assertIn("ошибка очистки NAT", (self.root / "output").read_text())
+        self.assertIn(["ip", "route", "flush", "table", "100"], self.commands())
+
+    def test_missing_cleanup_rules_are_not_errors(self):
+        self.start(nat=True)
+        self.wait_for(lambda: "NAT и FORWARD" in (self.root / "output").read_text())
+        fake = FAKE.replace('if name == "ip":', '''
+if name == "ip" and args[:2] == ["rule", "del"]:
+    print("RTNETLINK answers: No such file or directory", file=sys.stderr)
+    sys.exit(2)
+if name == "iptables" and "-D" in args:
+    print("Bad rule (does a matching rule exist in that chain?).", file=sys.stderr)
+    sys.exit(1)
+if name == "ip":''', 1)
+        for tool in ("ip", "iptables"):
+            (self.root / tool).write_text("#!" + sys.executable + "\n" + fake)
+        self.process.terminate()
+        self.assertEqual(self.process.wait(timeout=5), 0)
 
     def test_zero_cli_interval_is_rejected(self):
         result = subprocess.run([str(BINARY), "--monitor-interval", "0"], env=self.env, capture_output=True)

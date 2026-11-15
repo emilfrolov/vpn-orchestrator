@@ -6,7 +6,7 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use tokio::process::Command;
-use tracing::{debug, info};
+use tracing::info;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -63,10 +63,12 @@ impl NatSetup {
             return Ok(setup);
         }
 
-        setup.remove_rules().await;
+        setup.remove_rules().await?;
 
         if let Err(error) = setup.apply_rules().await {
-            setup.remove_rules().await;
+            if let Err(cleanup) = setup.remove_rules().await {
+                return Err(error.context(format!("очистка NAT также не удалась: {cleanup:#}")));
+            }
             return Err(error);
         }
 
@@ -86,11 +88,13 @@ impl NatSetup {
             return Ok(());
         }
         let previous = self.upstream_interface.clone();
-        self.remove_rules().await;
+        self.remove_rules().await?;
         self.upstream_interface = new_upstream.to_string();
 
         if let Err(error) = self.apply_rules().await {
-            self.remove_rules().await;
+            if let Err(cleanup) = self.remove_rules().await {
+                return Err(error.context(format!("очистка NAT также не удалась: {cleanup:#}")));
+            }
             self.upstream_interface = previous;
             if let Err(rollback) = self.apply_rules().await {
                 return Err(
@@ -136,31 +140,28 @@ impl NatSetup {
         Ok(())
     }
 
-    async fn remove_rules(&self) {
+    async fn remove_rules(&self) -> Result<()> {
         if !self.masquerade {
-            return;
+            return Ok(());
         }
         if self.use_nftables {
-            if let Err(e) = nft_delete_table().await {
-                debug!(error = %e, "nft table не найдена (нормально при первом старте)");
-            }
-        } else {
-            for rule in &iptables_rules(
-                &self.server_interface,
-                &self.upstream_interface,
-                &self.server_subnet,
-                "-D",
-            ) {
-                let _ = run_iptables(rule).await;
-            }
+            return nft_delete_table().await;
         }
+        let mut results = Vec::new();
+        for rule in &iptables_rules(
+            &self.server_interface,
+            &self.upstream_interface,
+            &self.server_subnet,
+            "-D",
+        ) {
+            results.push(run_iptables(rule).await);
+        }
+        crate::util::cleanup_result(results)
     }
 
-    /// Удаляет NAT/FORWARD правила. Безопасно вызывает при отсутствии правил.
     pub async fn cleanup(&self) -> Result<()> {
         info!("очистка NAT/FORWARD правил");
-        self.remove_rules().await;
-        Ok(())
+        self.remove_rules().await
     }
 }
 
@@ -226,11 +227,12 @@ fn iptables_rules(server: &str, upstream: &str, subnet: &str, action: &str) -> V
 }
 
 async fn nft_delete_table() -> Result<()> {
-    let output = Command::new("nft")
-        .args(["delete", "table", "ip", "vpn_orchestrator_nat"])
-        .output()
-        .await
-        .context("nft delete table")?;
+    let output = crate::util::command_output(
+        Command::new("nft").args(["delete", "table", "ip", "vpn_orchestrator_nat"]),
+        None,
+    )
+    .await
+    .context("nft delete table")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -243,39 +245,32 @@ async fn nft_delete_table() -> Result<()> {
 }
 
 async fn run_nft(script: &str) -> Result<()> {
-    use std::process::Stdio;
-    use tokio::io::AsyncWriteExt;
-
-    let mut child = Command::new("nft")
-        .args(["-f", "-"])
-        .stdin(Stdio::piped())
-        .spawn()
-        .context("запуск nft")?;
-
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(script.as_bytes())
-            .await
-            .context("запись nft rules")?;
-    }
-
-    let status = child.wait().await.context("ожидание nft")?;
-    if !status.success() {
-        anyhow::bail!("nft завершился с кодом {:?}", status.code());
-    }
+    let output = crate::util::command_output(
+        Command::new("nft").args(["-f", "-"]),
+        Some(script.as_bytes()),
+    )
+    .await?;
+    anyhow::ensure!(
+        output.status.success(),
+        "nft: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
     Ok(())
 }
 
 async fn run_iptables(args: &[String]) -> Result<()> {
     let display = args.join(" ");
-    let output = Command::new("iptables")
-        .args(args)
-        .output()
+    let output = crate::util::command_output(Command::new("iptables").args(args), None)
         .await
         .with_context(|| format!("iptables {display}"))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        if args.iter().any(|arg| arg == "-D")
+            && stderr.contains("Bad rule (does a matching rule exist in that chain?)")
+        {
+            return Ok(());
+        }
         anyhow::bail!("iptables {display}: {}", stderr.trim());
     }
     Ok(())

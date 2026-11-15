@@ -79,8 +79,8 @@ impl ServerInterface {
                 return Ok(());
             }
             info!(config = %path.display(), "{} up", self.quick_binary);
-            run_command(self.quick_binary, "up", path).await?;
             self.started = true;
+            run_command(self.quick_binary, "up", path).await?;
             info!(interface = %path.file_stem().and_then(|s| s.to_str()).unwrap_or("wg"), "интерфейс поднят");
         }
         Ok(())
@@ -170,12 +170,10 @@ impl ServerInterface {
 }
 
 async fn run_command(binary: &str, action: &str, config_path: &std::path::Path) -> Result<()> {
-    let output = Command::new(binary)
-        .arg(action)
-        .arg(config_path)
-        .output()
-        .await
-        .with_context(|| format!("{binary} {action} {}", config_path.display()))?;
+    let output =
+        crate::util::command_output(Command::new(binary).arg(action).arg(config_path), None)
+            .await
+            .with_context(|| format!("{binary} {action} {}", config_path.display()))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

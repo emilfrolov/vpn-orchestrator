@@ -693,7 +693,20 @@ impl Selector {
         &mut self,
         scores: &[(usize, &str, f64, VpnState)],
     ) -> Option<SwitchDecision> {
-        if !self.config.enabled || scores.is_empty() {
+        if !self.config.enabled {
+            debug!(
+                event = "selector_blocked",
+                reason = "disabled",
+                "selector: переключение пропущено"
+            );
+            return None;
+        }
+        if scores.is_empty() {
+            debug!(
+                event = "selector_blocked",
+                reason = "no_measurements",
+                "selector: переключение пропущено"
+            );
             return None;
         }
 
@@ -735,7 +748,12 @@ impl Selector {
                     };
                     return Some(decision);
                 } else {
-                    info!("selector: нет здоровых кандидатов для failover");
+                    info!(
+                        event = "selector_blocked",
+                        reason = "no_healthy_candidates",
+                        current = name,
+                        "selector: нет здоровых кандидатов для failover"
+                    );
                     return None;
                 }
             }
@@ -745,12 +763,28 @@ impl Selector {
         let active_name = active_entry.map(|(_, n, _, _)| *n).unwrap_or("?");
 
         if let Some(last) = self.last_switch {
-            if last.elapsed().as_secs() < self.config.cooldown_secs {
+            let elapsed = last.elapsed().as_secs();
+            if elapsed < self.config.cooldown_secs {
+                debug!(
+                    event = "selector_blocked",
+                    reason = "cooldown",
+                    current = active_name,
+                    remaining_secs = self.config.cooldown_secs - elapsed,
+                    "selector: переключение пропущено"
+                );
                 return None;
             }
         }
         if let Some(since) = self.active_since {
-            if since.elapsed().as_secs() < self.config.minimum_hold_secs {
+            let elapsed = since.elapsed().as_secs();
+            if elapsed < self.config.minimum_hold_secs {
+                debug!(
+                    event = "selector_blocked",
+                    reason = "minimum_hold",
+                    current = active_name,
+                    remaining_secs = self.config.minimum_hold_secs - elapsed,
+                    "selector: переключение пропущено"
+                );
                 return None;
             }
         }
@@ -762,6 +796,12 @@ impl Selector {
             .copied();
 
         let Some((cand_i, cand_name, cand_score, _)) = candidate else {
+            debug!(
+                event = "selector_blocked",
+                reason = "no_healthy_candidates",
+                current = active_name,
+                "selector: переключение пропущено"
+            );
             self.candidate = None;
             self.candidate_wins = 0;
             return None;
@@ -769,6 +809,17 @@ impl Selector {
 
         let required = active_score * (1.0 + self.config.minimum_advantage);
         if cand_score < required {
+            debug!(
+                event = "selector_blocked",
+                reason = "insufficient_advantage",
+                current = active_name,
+                current_score = active_score,
+                candidate = cand_name,
+                candidate_score = cand_score,
+                required_score = required,
+                minimum_advantage = self.config.minimum_advantage,
+                "selector: переключение пропущено"
+            );
             self.candidate = None;
             self.candidate_wins = 0;
             return None;
@@ -802,6 +853,7 @@ impl Selector {
             Some(decision)
         } else {
             info!(
+                event = "selector_waiting",
                 current = active_name,
                 current_score = format!("{:.1}", active_score),
                 candidate = cand_name,
@@ -923,13 +975,14 @@ impl Monitor {
     pub(crate) fn apply_health_probes(
         &mut self,
         outcomes: Vec<HealthProbeOutcome>,
+        active_idx: Option<usize>,
     ) -> Option<SwitchDecision> {
         let targets = self.config.health_targets.clone();
         let alpha = self.config.ewma_alpha;
         let history_size = self.config.history_size;
         let sc = self.scoring_config.clone();
 
-        for (vpn, outcome) in self.metrics.iter_mut().zip(outcomes) {
+        for (index, (vpn, outcome)) in self.metrics.iter_mut().zip(outcomes).enumerate() {
             let completed_at = outcome.results.last().map(|(at, _)| *at);
             let mut failed_targets = 0;
             for (target, (timestamp, result)) in targets.iter().zip(outcome.results) {
@@ -945,6 +998,7 @@ impl Monitor {
                         if !result.success || result.loss_pct > 5.0 {
                             debug!(vpn = %vpn.name, interface = %vpn.interface, target = target,
                                   success = result.success, loss_pct = format!("{:.1}", result.loss_pct),
+                                  rtt_ms = ?result.mean_rtt(), jitter_ms = result.jitter_ms,
                                   "health probe anomaly");
                         }
                         vpn.add_health_sample(sample, alpha, history_size);
@@ -980,6 +1034,19 @@ impl Monitor {
             vpn.update_state(targets.len(), failed_targets, &sc);
             vpn.probed_at = completed_at;
 
+            debug!(event = "upstream_score", vpn = %vpn.name, interface = %vpn.interface,
+                   selected = active_idx == Some(index), state = %vpn.state,
+                   reachable = ?vpn.reachable, failed_targets, total_targets = targets.len(),
+                   raw_score = ?score, ewma_score = ?vpn.ewma_score,
+                   final_score = ?vpn.compute_final_score(&sc),
+                   availability_5m = vpn.availability(300), availability_30m = vpn.availability(1800),
+                   ewma_rtt_ms = ?vpn.ewma_rtt, ewma_loss_pct = ?vpn.ewma_loss,
+                   ewma_jitter_ms = ?vpn.ewma_jitter, https_success_ratio = ?https_ratio(vpn),
+                   download_mbps = ?vpn.quality_mbps,
+                   health_probe_age_secs = ?completed_at.map(|at| at.elapsed().as_secs_f64()),
+                   https_probe_age_secs = ?vpn.https_samples.back().map(|s| s.timestamp.elapsed().as_secs_f64()),
+                   "метрики и компоненты score upstream");
+
             if vpn.state_changed() {
                 if vpn.state == VpnState::Unhealthy {
                     warn!(event = "upstream_unhealthy", vpn = %vpn.name, reachable = vpn.reachable,
@@ -1008,7 +1075,8 @@ impl Monitor {
             .collect::<Vec<_>>()
             .join(", ");
         debug!(scores = %summary, "score upstream-ов за цикл мониторинга");
-        self.selector.evaluate(&scores)
+        tracing::info_span!("selector", source = "health_score")
+            .in_scope(|| self.selector.evaluate(&scores))
     }
 
     pub(crate) fn start_https_probes(&self) -> JoinHandle<Vec<HttpsProbeOutcome>> {

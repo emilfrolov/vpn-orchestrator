@@ -62,6 +62,34 @@ HTTPS-пробы запускаются параллельно в фоновой
 
 Событие `download probe diagnostics` содержит URL, HTTP-код, объём ответа, тип содержимого, удалённый IP, скорость в байтах/с и тайминги DNS/TCP/TLS/первого байта/всей загрузки. Оно записывается и при ошибке curl, чтобы отличать медленную передачу от задержки соединения или ответа сервера.
 
+## Диагностические логи
+
+На INFO при запуске записываются действующие настройки: `selection_config`,
+`monitoring_config` и `upstream_health_config`. Они содержат порог скорости,
+параметры selector, веса scoring и параметры health-check.
+
+Для подробного разбора выбора upstream задайте `level = "debug"` в `[logging]`:
+
+- `upstream_score` — метрики каждого upstream, доступность за 5/30 минут,
+  RTT, потери, jitter, HTTPS, скорость и возраст ICMP/HTTPS-проб.
+  `raw_score` — оценка до сглаживания, `ewma_score` определяет состояние,
+  `final_score` используется selector с учётом истории. `download_mbps`
+  служит диагностикой и в этот score не входит.
+- `selector_blocked` — причина отказа от переключения: отключённый selector,
+  отсутствие измерений/кандидатов, cooldown, minimum hold или недостаточное
+  преимущество. Для ожидания таймера указывается `remaining_secs`.
+- `speed_switch_skipped` — диагностический режим (`min_mbps = 0`), отсутствие
+  замера активного канала, достаточная скорость или отсутствие более быстрого кандидата.
+
+Контекст `selector{source="health_score"}` или `selector{source="download_speed"}`
+различает два механизма выбора; `vpn_switch_requested` также содержит `source`.
+На INFO успешная проверка после переключения отмечается `vpn_switch_verified`
+с `verification="post_activation_ping"`. Обычный аварийный failover пишет
+`vpn_failover_started` и `vpn_failover_completed` либо `vpn_failover_failed`.
+Успех этой ветки имеет `verification="pre_activation_ping_only"`: отдельного
+ping после активации в ней нет. Эти проверки подтверждают ответ upstream,
+но не проверяют клиентский путь через FORWARD/NAT.
+
 ## Prometheus
 
 При `monitoring.enabled = true` и `prometheus_enabled = true` endpoint доступен на `http://<host>:9099/metrics` на всех IPv4-интерфейсах. Ограничьте доступ внешним firewall. Отключённые upstream в метрики не попадают.

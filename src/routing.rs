@@ -97,7 +97,9 @@ impl RoutingSetup {
         };
 
         if let Err(error) = setup.apply_policy_rule().await {
-            let _ = setup.cleanup().await;
+            if let Err(cleanup) = setup.cleanup().await {
+                return Err(error.context(format!("ошибка очистки маршрутизации: {cleanup:#}")));
+            }
             return Err(error);
         }
 
@@ -153,10 +155,11 @@ impl RoutingSetup {
     }
 
     pub async fn direct_route(&self, server_interface: &str) -> Result<ExitRoute> {
-        let output = Command::new("ip")
-            .args(["-4", "route", "show", "table", "main", "default"])
-            .output()
-            .await?;
+        let output = crate::util::command_output(
+            Command::new("ip").args(["-4", "route", "show", "table", "main", "default"]),
+            None,
+        )
+        .await?;
         anyhow::ensure!(
             output.status.success(),
             "не удалось прочитать основной маршрут: {}",
@@ -176,55 +179,65 @@ impl RoutingSetup {
     pub async fn cleanup(&self) -> Result<()> {
         info!("очистка правил маршрутизации");
 
+        let mut results = Vec::new();
         let table = self.route_table.to_string();
         let subnet = self.server_subnet.to_string();
 
-        let _ = run_ip(&[
-            "rule",
-            "del",
-            "priority",
-            "99",
-            "from",
-            &self.server_ip,
-            "lookup",
-            "main",
-        ])
-        .await;
+        results.push(
+            cleanup_ip(&[
+                "rule",
+                "del",
+                "priority",
+                "99",
+                "from",
+                &self.server_ip,
+                "lookup",
+                "main",
+            ])
+            .await,
+        );
         for (interface, table) in &self.probe_tables {
             let table = table.to_string();
-            let _ = run_ip(&[
-                "rule", "del", "priority", "98", "oif", interface, "table", &table,
-            ])
-            .await;
-            let _ = run_ip(&["route", "flush", "table", &table]).await;
+            results.push(
+                cleanup_ip(&[
+                    "rule", "del", "priority", "98", "oif", interface, "table", &table,
+                ])
+                .await,
+            );
+            results.push(cleanup_ip(&["route", "flush", "table", &table]).await);
         }
-        let _ = run_ip(&[
-            "rule", "del", "priority", "100", "from", &subnet, "table", &table,
-        ])
-        .await;
-        let _ = run_ip(&["route", "flush", "table", &table]).await;
-        let _ = run_ip(&[
-            "rule",
-            "del",
-            "priority",
-            "101",
-            "from",
-            &subnet,
-            "type",
-            "unreachable",
-        ])
-        .await;
+        results.push(
+            cleanup_ip(&[
+                "rule", "del", "priority", "100", "from", &subnet, "table", &table,
+            ])
+            .await,
+        );
+        results.push(cleanup_ip(&["route", "flush", "table", &table]).await);
+        results.push(
+            cleanup_ip(&[
+                "rule",
+                "del",
+                "priority",
+                "101",
+                "from",
+                &subnet,
+                "type",
+                "unreachable",
+            ])
+            .await,
+        );
 
-        Ok(())
+        crate::util::cleanup_result(results)
     }
 }
 
 async fn get_interface_ip(interface: &str) -> Result<String> {
-    let output = Command::new("ip")
-        .args(["-4", "-o", "addr", "show", interface])
-        .output()
-        .await
-        .with_context(|| format!("ip addr show {interface}"))?;
+    let output = crate::util::command_output(
+        Command::new("ip").args(["-4", "-o", "addr", "show", interface]),
+        None,
+    )
+    .await
+    .with_context(|| format!("ip addr show {interface}"))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     // Формат: "5: br-xxx    inet 10.42.42.42/24 brd ... scope global ..."
@@ -240,9 +253,7 @@ async fn get_interface_ip(interface: &str) -> Result<String> {
 }
 
 async fn run_ip(args: &[&str]) -> Result<()> {
-    let output = Command::new("ip")
-        .args(args)
-        .output()
+    let output = crate::util::command_output(Command::new("ip").args(args), None)
         .await
         .with_context(|| format!("ip {}", args.join(" ")))?;
 
@@ -258,11 +269,9 @@ async fn ensure_rule(selector: &[&str]) -> Result<()> {
     let query = selector
         .strip_suffix(&["type", "unreachable"])
         .unwrap_or(selector);
-    let output = Command::new("ip")
-        .args(["rule", "show"])
-        .args(query)
-        .output()
-        .await?;
+    let output =
+        crate::util::command_output(Command::new("ip").args(["rule", "show"]).args(query), None)
+            .await?;
     anyhow::ensure!(
         output.status.success(),
         "ip rule show: {}",
@@ -317,6 +326,20 @@ fn parse_direct_route(output: &str, excluded: &[&str]) -> Option<ExitRoute> {
         })
         .min_by_key(|(metric, _)| *metric)
         .map(|(_, route)| route)
+}
+
+async fn cleanup_ip(args: &[&str]) -> Result<()> {
+    let output = crate::util::command_output(Command::new("ip").args(args), None).await?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    anyhow::ensure!(
+        output.status.success()
+            || stderr.contains("No such file or directory")
+            || stderr.contains("FIB table does not exist"),
+        "ip {}: {}",
+        args.join(" "),
+        stderr.trim()
+    );
+    Ok(())
 }
 
 #[cfg(test)]

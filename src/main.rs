@@ -83,11 +83,18 @@ async fn main() -> Result<()> {
     let mut server = ServerInterface::new(&config);
 
     if managed_server {
-        server.ensure_interface().await?;
+        if let Err(error) = server.ensure_interface().await {
+            if let Err(cleanup) = server.teardown().await {
+                return Err(error.context(format!("ошибка очистки: {cleanup:#}")));
+            }
+            return Err(error);
+        }
     }
     if let Err(error) = server.check_interface_up().await {
         if managed_server {
-            let _ = server.teardown().await;
+            if let Err(cleanup) = server.teardown().await {
+                return Err(error.context(format!("ошибка очистки сервера: {cleanup:#}")));
+            }
         }
         return Err(error);
     }
@@ -97,7 +104,9 @@ async fn main() -> Result<()> {
         Ok(manager) => manager,
         Err(error) => {
             if managed_server {
-                let _ = server.teardown().await;
+                if let Err(cleanup) = server.teardown().await {
+                    return Err(error.context(format!("ошибка очистки сервера: {cleanup:#}")));
+                }
             }
             return Err(error);
         }
@@ -151,17 +160,24 @@ async fn main() -> Result<()> {
         h.abort();
     }
     info!("остановка vpn-orchestrator");
-    upstreams.shutdown().await;
+    let mut cleanup_results = vec![upstreams.shutdown().await];
 
     if managed_server {
-        if let Err(e) = server.teardown().await {
-            error!(error = %e, "ошибка остановки серверного интерфейса");
-        }
+        cleanup_results.push(
+            server
+                .teardown()
+                .await
+                .context("ошибка остановки серверного интерфейса"),
+        );
     } else {
         info!("серверный интерфейс не опускается (--skip-server)");
     }
 
-    Ok(())
+    let result = crate::util::cleanup_result(cleanup_results);
+    if let Err(error) = &result {
+        error!(event = "cleanup_failed", error = %format!("{error:#}"), "остановка завершилась с ошибками очистки");
+    }
+    result
 }
 
 /// Ожидает SIGINT или SIGTERM для graceful shutdown.

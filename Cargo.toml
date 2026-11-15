@@ -7,6 +7,7 @@ license = "MIT"
 
 [dependencies]
 anyhow = "1"
+libc = "0.2"
 clap = { version = "4", features = ["derive"] }
 ipnetwork = { version = "0.21", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
