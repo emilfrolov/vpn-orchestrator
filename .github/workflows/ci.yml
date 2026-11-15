@@ -6,6 +6,8 @@ on:
     tags: ['v*.*.*']
   pull_request:
     branches: [master]
+  release:
+    types: [published]
   schedule:
     - cron: '39 11 * * *'
   workflow_dispatch:
@@ -66,12 +68,15 @@ jobs:
     needs: build
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
     permissions:
       contents: read
       packages: write
       id-token: write
     env:
-      REGISTRY: ghcr.io
+      GHCR_IMAGE: ghcr.io/${{ github.repository }}
+      DOCKERHUB_IMAGE: docker.io/donakan/vpn-orchestrator
       # Ручной запуск из другой ветки только проверяет сборку.
       PUBLISH: ${{ github.event_name != 'pull_request' && (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')) }}
     steps:
@@ -87,7 +92,9 @@ jobs:
         id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
-          images: ${{ env.REGISTRY }}/${{ github.repository }}
+          images: |
+            ${{ env.GHCR_IMAGE }}
+            ${{ env.DOCKERHUB_IMAGE }}
           tags: |
             type=ref,event=branch
             type=ref,event=pr
@@ -101,15 +108,24 @@ jobs:
         if: env.PUBLISH == 'true'
         uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
-          registry: ${{ env.REGISTRY }}
+          registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log into Docker Hub
+        if: env.PUBLISH == 'true'
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Build and optionally push Docker image
         id: image
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
+          file: ./Dockerfile
           platforms: linux/amd64
           pull: true
           no-cache: ${{ github.event_name == 'schedule' }}
@@ -125,9 +141,56 @@ jobs:
         with:
           cosign-release: v3.1.4
 
-      - name: Sign the published Docker image
+      - name: Sign the published Docker images
         if: env.PUBLISH == 'true'
         env:
-          IMAGE: ${{ fromJSON(steps.meta.outputs.json).tags[0] }}
           DIGEST: ${{ steps.image.outputs.digest }}
-        run: cosign sign --yes "${IMAGE}@${DIGEST}"
+        run: |
+          cosign sign --yes "${GHCR_IMAGE,,}@${DIGEST}"
+          cosign sign --yes "${DOCKERHUB_IMAGE}@${DIGEST}"
+
+  release-notes:
+    name: Release image instructions
+    if: github.event_name == 'release' && startsWith(github.ref, 'refs/tags/v')
+    needs: docker
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    env:
+      GHCR_IMAGE: ghcr.io/${{ github.repository }}
+      DOCKERHUB_IMAGE: docker.io/donakan/vpn-orchestrator
+      IMAGE_VERSION: ${{ needs.docker.outputs.version }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      RELEASE_TAG: ${{ github.event.release.tag_name }}
+    steps:
+      - name: Update Docker instructions in release notes
+        shell: bash
+        working-directory: ${{ runner.temp }}
+        run: |
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json body --jq .body > release-notes.md
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          notes = Path("release-notes.md")
+          start = "<!-- vpn-orchestrator:docker -->"
+          end = "<!-- /vpn-orchestrator:docker -->"
+          body = re.sub(re.escape(start) + ".*?" + re.escape(end), "", notes.read_text(), flags=re.S).rstrip()
+          version = os.environ["IMAGE_VERSION"]
+          section = "\n".join([
+              start,
+              "### Docker",
+              "",
+              "Образ для `linux/amd64`. Скачайте из одного из реестров:",
+              "",
+              "```bash",
+              f'docker pull {os.environ["DOCKERHUB_IMAGE"]}:{version}',
+              f'docker pull {os.environ["GHCR_IMAGE"].lower()}:{version}',
+              "```",
+              end,
+          ])
+          notes.write_text(body + ("\n\n" if body else "") + section + "\n")
+          PY
+          gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --notes-file release-notes.md
