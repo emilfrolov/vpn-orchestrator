@@ -5,6 +5,7 @@ Run after cargo build: python3 tests/regression.py
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import subprocess
 import sys
@@ -71,6 +72,13 @@ elif name == "curl":
 elif name == "nft":
     if "-f" in args:
         sys.stdin.read()
+elif name == "xray":
+    with (root / "xray-starts").open("a") as log:
+        log.write(str(time.time()) + "\n")
+    while not (root / "xray-fail").exists():
+        time.sleep(0.05)
+    print("fake xray rejected configuration: exit 23", file=sys.stderr, flush=True)
+    sys.exit(23)
 '''
 
 CONFIG = '''
@@ -107,7 +115,7 @@ class LifecycleTests(unittest.TestCase):
         self.env = dict(os.environ, VPN_TEST_ROOT=str(self.root))
         self.env.pop("RUST_LOG", None)
         self.env["PATH"] = str(self.root) + os.pathsep + self.env["PATH"]
-        for tool in ("ip", "ping", "curl", "wg", "awg", "wg-quick", "awg-quick", "iptables", "nft"):
+        for tool in ("ip", "ping", "curl", "wg", "awg", "wg-quick", "awg-quick", "iptables", "nft", "xray"):
             path = self.root / tool
             path.write_text("#!" + sys.executable + "\n" + FAKE)
             path.chmod(0o755)
@@ -146,6 +154,68 @@ class LifecycleTests(unittest.TestCase):
 
     def selected(self, interface):
         return ["ip", "route", "replace", "default", "dev", interface, "table", "100"] in self.commands()
+
+    def start_failing_xray(self):
+        (self.root / "xray-fail").touch()
+        (self.root / "xray.json").write_text('{}')
+        self.start(
+            extra='[monitoring]\nenabled=true\nhealth_interval=1\nhealth_probe_count=1\nhttps_enabled=false\n[speed_test]\nenabled=true\ninterval=1',
+            disabled=f'[[upstream]]\nname="xray-backup"\ntype="xray"\ninterface="tun3"\nconfig_path="{self.root}/xray.json"\nhealth_check_interval=1\nhealth_check_timeout=1',
+        )
+
+    def xray_failures(self):
+        return [line for line in (self.root / "output").read_text().splitlines()
+                if 'event="upstream_recovery_failed" upstream="xray-backup"' in line]
+
+    def xray_starts(self):
+        path = self.root / "xray-starts"
+        return [float(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+    def test_xray_exit_23_obeys_shared_backoff_without_blocking_active_check(self):
+        self.start_failing_xray()
+        self.wait_for(lambda: len(self.xray_failures()) >= 2, timeout=20)
+        failures = self.xray_failures()
+        first_retry_ms = int(re.search(r'retry_ms=(\d+)', failures[0])[1])
+        second_retry_ms = int(re.search(r'retry_ms=(\d+)', failures[1])[1])
+        self.assertTrue(5_000 <= first_retry_ms <= 10_000)
+        self.assertTrue(10_000 <= second_retry_ms <= 20_000)
+        starts = self.xray_starts()
+        self.assertEqual(len(starts), 2)
+        # Две секунды стартовой проверки Xray предшествуют отсчёту backoff.
+        self.assertGreaterEqual(starts[1] - starts[0], 2 + first_retry_ms / 1000 - 0.1)
+        self.assertIn('failures=2', failures[1])
+        self.assertIn('xray завершился преждевременно: exit status: 23', failures[1])
+        self.assertIn('fake xray rejected configuration: exit 23', (self.root / "output").read_text())
+        (self.root / "wg1-down").touch()
+        self.wait_for(lambda: self.selected("wg2"), timeout=3)
+        self.assertEqual(len(self.xray_starts()), 2)
+        # ICMP, периодический опрос и speed test продолжают запрашивать recovery.
+        self.wait_for(lambda: len(self.xray_failures()) >= 3, timeout=25)
+        starts = self.xray_starts()
+        self.assertEqual(len(starts), 3)
+        self.assertGreaterEqual(starts[2] - starts[1], 2 + second_retry_ms / 1000 - 0.1)
+        self.assertIn('failures=3', self.xray_failures()[2])
+        for failure in self.xray_failures():
+            self.assertRegex(failure, r'next_retry_unix_ms=\d+')
+
+    def test_xray_backoff_resets_only_after_confirmed_recovery(self):
+        self.start_failing_xray()
+        self.wait_for(lambda: len(self.xray_failures()) == 1)
+        (self.root / "tun3-down").touch()
+        (self.root / "xray-fail").unlink()
+        # Процесс запустился, но ping ещё не проходит: backoff продолжает расти.
+        self.wait_for(lambda: len(self.xray_failures()) == 2, timeout=15)
+        self.assertIn('failures=2', self.xray_failures()[1])
+        self.assertNotIn('upstream_recovery_succeeded', (self.root / "output").read_text())
+        (self.root / "tun3-down").unlink()
+        self.wait_for(lambda: 'event="upstream_recovery_succeeded" upstream="xray-backup" attempts=3' in (self.root / "output").read_text(), timeout=25)
+        # Уже работающий процесс переиспользуется; после подтверждения счётчик — с нуля.
+        self.assertEqual(len(self.xray_starts()), 2)
+        (self.root / "xray-fail").touch()
+        self.wait_for(lambda: len(self.xray_failures()) >= 3)
+        failure = self.xray_failures()[2]
+        self.assertIn('failures=1', failure)
+        self.assertTrue(5_000 <= int(re.search(r'retry_ms=(\d+)', failure)[1]) <= 10_000)
 
     def test_failover_keeps_nat_disabled(self):
         self.start()

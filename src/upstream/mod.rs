@@ -10,8 +10,9 @@
 //! 3. Добавить match-ветки в методы `UpstreamKind`
 //! 4. Добавить тип в [`UpstreamType`] и в [`create_upstream`]
 
+use std::hash::{BuildHasher, RandomState};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 
@@ -91,6 +92,7 @@ fn create_upstream(config: &UpstreamConfig) -> Result<UpstreamKind> {
 pub struct UpstreamManager {
     upstreams: Vec<Arc<UpstreamKind>>,
     recovery_tasks: Vec<Option<JoinHandle<Result<()>>>>,
+    recovery_backoff: Vec<RecoveryBackoff>,
     ready: Vec<bool>,
     active_index: Option<usize>,
     failure_count: u32,
@@ -118,6 +120,31 @@ struct SpeedMeasurement {
     result: Result<monitor::QualityResult>,
 }
 
+const RECOVERY_BASE_MS: u64 = 10_000;
+const RECOVERY_MAX_MS: u64 = 300_000;
+
+#[derive(Clone, Default)]
+struct RecoveryBackoff {
+    failures: u32,
+    next_attempt: Option<Instant>,
+}
+
+impl RecoveryBackoff {
+    fn allows(&self, now: Instant) -> bool {
+        self.next_attempt.is_none_or(|next| now >= next)
+    }
+
+    fn record_failure(&mut self, now: Instant, jitter: u64) -> Duration {
+        self.failures = self.failures.saturating_add(1);
+        let ceiling_ms =
+            (RECOVERY_BASE_MS * (1_u64 << (self.failures - 1).min(5))).min(RECOVERY_MAX_MS);
+        // Equal jitter: половина экспоненциальной задержки плюс случайная часть.
+        let delay = Duration::from_millis(ceiling_ms / 2 + jitter % (ceiling_ms / 2 + 1));
+        self.next_attempt = Some(now + delay);
+        delay
+    }
+}
+
 impl UpstreamManager {
     pub async fn start(config: &Config) -> Result<Self> {
         let upstreams: Vec<Arc<UpstreamKind>> = config
@@ -139,6 +166,7 @@ impl UpstreamManager {
         let mut manager = Self {
             ready: vec![false; upstreams.len()],
             recovery_tasks: (0..upstreams.len()).map(|_| None).collect(),
+            recovery_backoff: vec![RecoveryBackoff::default(); upstreams.len()],
             upstreams,
             active_index: None,
             failure_count: 0,
@@ -403,13 +431,20 @@ impl UpstreamManager {
     }
 
     fn request_recovery(&mut self, index: usize) {
-        if self.recovery_tasks[index].is_none() {
+        if self.recovery_tasks[index].is_none()
+            && self.recovery_backoff[index].allows(Instant::now())
+        {
             let upstream = self.upstreams[index].clone();
             let routing = self.routing.clone();
+            let needs_confirmation = self.recovery_backoff[index].failures > 0;
             self.recovery_tasks[index] = Some(tokio::spawn(async move {
                 upstream.start().await?;
                 if let Some(routing) = routing {
                     routing.prepare_probe_route(upstream.interface()).await?;
+                }
+                // После отказа одного запуска недостаточно для сброса backoff.
+                if needs_confirmation {
+                    upstream.health_check().await?;
                 }
                 Ok(())
             }));
@@ -425,14 +460,39 @@ impl UpstreamManager {
             .context("recovery task")
             .and_then(|result| result);
         self.ready[index] = result.is_ok();
-        if let Err(error) = result {
-            warn!(upstream = self.upstreams[index].name(), error = %error, "восстановление upstream не удалось");
+        let backoff = &mut self.recovery_backoff[index];
+        match result {
+            Ok(()) => {
+                if backoff.failures > 0 {
+                    info!(
+                        event = "upstream_recovery_succeeded",
+                        upstream = self.upstreams[index].name(),
+                        attempts = u64::from(backoff.failures) + 1,
+                        "восстановление upstream подтверждено; backoff сброшен"
+                    );
+                }
+                *backoff = RecoveryBackoff::default();
+            }
+            Err(error) => {
+                let delay = backoff.record_failure(Instant::now(), RandomState::new().hash_one(()));
+                let next_retry_unix_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .saturating_add(delay)
+                    .as_millis();
+                warn!(event = "upstream_recovery_failed", upstream = self.upstreams[index].name(),
+                      error = %error, failures = backoff.failures, retry_ms = delay.as_millis(),
+                      next_retry_unix_ms, "восстановление upstream не удалось");
+            }
         }
     }
 
     fn ensure_upstream_ready(&mut self, index: usize) -> Result<()> {
         if !self.ready[index] {
             self.request_recovery(index);
+            if !self.recovery_backoff[index].allows(Instant::now()) {
+                anyhow::bail!("повторное восстановление upstream отложено (backoff)");
+            }
             anyhow::bail!("восстановление upstream выполняется в фоне");
         }
         Ok(())
@@ -451,6 +511,10 @@ impl UpstreamManager {
                     .is_some_and(JoinHandle::is_finished)
                 {
                     self.finish_recovery(i).await;
+                }
+                // Повторяем отказы по их сроку, независимо от интервала мониторинга.
+                if self.recovery_backoff[i].failures > 0 {
+                    self.request_recovery(i);
                 }
             }
             if last_recovery.is_none_or(|t| t.elapsed() >= Duration::from_secs(10)) {
@@ -564,7 +628,7 @@ impl UpstreamManager {
                 continue;
             }
             if let Err(e) = self.ensure_upstream_ready(i) {
-                warn!(upstream = self.upstreams[i].name(), error = %e, "speed test: upstream недоступен");
+                debug!(upstream = self.upstreams[i].name(), error = %e, "speed test: upstream недоступен");
                 continue;
             }
             interfaces.push((i, self.upstreams[i].interface().to_string()));
@@ -667,7 +731,7 @@ impl UpstreamManager {
         }
 
         if let Err(e) = self.ensure_upstream_ready(to_idx) {
-            warn!(candidate = %d.to_name, error = %e, "preflight start failed");
+            debug!(candidate = %d.to_name, error = %e, "preflight start failed");
             if let Some(ref mut m) = self.monitor {
                 m.set_selector_active(from_idx);
             }
@@ -843,7 +907,55 @@ fn speed_candidate(speeds: &[Option<f64>], active: usize, minimum: f64) -> Optio
 
 #[cfg(test)]
 mod tests {
-    use super::speed_candidate;
+    use super::{speed_candidate, RecoveryBackoff, RECOVERY_MAX_MS};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn recovery_backoff_grows_caps_and_respects_deadline() {
+        let mut backoff = RecoveryBackoff::default();
+        let mut now = Instant::now();
+        assert!(backoff.allows(now));
+        for ceiling_ms in [10_000, 20_000, 40_000, 80_000, 160_000, 300_000, 300_000] {
+            let delay = backoff.record_failure(now, ceiling_ms / 2);
+            assert_eq!(delay, Duration::from_millis(ceiling_ms));
+            assert!(!backoff.allows(now));
+            assert!(!backoff.allows(now + delay - Duration::from_nanos(1)));
+            now += delay;
+            assert!(backoff.allows(now));
+        }
+        backoff.failures = u32::MAX;
+        assert_eq!(
+            backoff.record_failure(now, RECOVERY_MAX_MS / 2),
+            Duration::from_millis(RECOVERY_MAX_MS)
+        );
+        assert_eq!(backoff.failures, u32::MAX);
+    }
+
+    #[test]
+    fn recovery_jitter_is_bounded_and_upstreams_are_independent() {
+        let now = Instant::now();
+        for failures in [0, 1, 5, u32::MAX] {
+            let initial = RecoveryBackoff {
+                failures,
+                next_attempt: None,
+            };
+            let ceiling_ms = if failures == 0 {
+                10_000
+            } else if failures == 1 {
+                20_000
+            } else {
+                RECOVERY_MAX_MS
+            };
+            for jitter in [0, 1, ceiling_ms / 2, ceiling_ms, u64::MAX] {
+                let mut backoff = initial.clone();
+                let delay = backoff.record_failure(now, jitter);
+                assert!(delay >= Duration::from_millis(ceiling_ms / 2));
+                assert!(delay <= Duration::from_millis(ceiling_ms));
+                assert!(initial.allows(now));
+                assert!(!backoff.allows(now));
+            }
+        }
+    }
 
     #[test]
     fn speed_switch_requires_low_active_speed_and_faster_candidate() {
