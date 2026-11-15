@@ -112,7 +112,7 @@ class LifecycleTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="vpn-regression-")
         self.root = Path(self.temp.name)
-        self.env = dict(os.environ, VPN_TEST_ROOT=str(self.root))
+        self.env = dict(os.environ, VPN_TEST_ROOT=str(self.root), NO_COLOR="1")
         self.env.pop("RUST_LOG", None)
         self.env["PATH"] = str(self.root) + os.pathsep + self.env["PATH"]
         for tool in ("ip", "ping", "curl", "wg", "awg", "wg-quick", "awg-quick", "iptables", "nft", "xray"):
